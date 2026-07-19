@@ -1,0 +1,13 @@
+# Copy to config.yaml and fill in real values.
+# Do not commit config.yaml.
+
+cursor:
+  session_token: "REPLACE_WITH_WorkosCursorSessionToken"
+  timezone: "Asia/Ho_Chi_Minh"
+
+telegram:
+  bot_token: "REPLACE_WITH_TELEGRAM_BOT_TOKEN"
+  chat_id: "REPLACE_WITH_GROUP_CHAT_ID"
+
+report:
+  locale: "vi"
