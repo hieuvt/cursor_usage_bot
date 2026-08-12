@@ -135,20 +135,28 @@ Group theo `model`; thiếu model → `"unknown"`.
 - Có thể kèm message từ summary nếu hữu ích
 - Không có → ghi **“Không có khuyến mại”**
 
-### Ước tính tiền (USD)
+### Đơn vị đo & tiền trên báo cáo
 
-Quy ước: **1 đơn vị plan = $0.01** (Pro `included = 2000` ↔ `$20`).
+**Plan unit** là đơn vị cơ bản (từ event: `chargedCents` raw ≈ 1 plan unit).
 
 | Số trên báo cáo | Cách lấy |
 |-----------------|----------|
-| Khuyến mại (bonus) USD | `breakdown.bonus / 100` |
-| Gói cước (subscription) | Map `membershipType` → giá tháng (pro $20, pro_plus $60, ultra $200) |
-| Included kèm gói | `breakdown.included / 100` |
-| Gói cước + khuyến mại | subscription + bonus USD |
-| On-demand (ước tính) | `max(0, gross_cycle − included − bonus)` theo cửa sổ cycle-to-date |
-| Gross usage chu kỳ | Tổng `chargedCents` events (như cũ) |
+| Số tiền included | Map `membershipType` → giá tháng (pro $20, pro_plus $60, ultra $200) |
+| Số plan unit included | `plan.limit` |
+| USD / 1 plan unit | `included_money / included_plan_units` |
+| Plan unit bonus (pool) | `breakdown.bonus*` nếu có; không có → `0` |
+| Plan unit / tiền đã dùng (chu kỳ, hôm qua) | Cộng `chargedCents` events trong cửa sổ; tiền = `units × usd_per_unit` |
+| Included còn lại | `max(0, included_pool − units_used_from_included)`; tiền = còn lại × `usd_per_unit` |
+| On-demand đã trả | `individualUsage.onDemand.used / 100` |
+| Ước tính EOC units | `avg_daily × tổng_ngày_chu_kỳ` (avg từ units đến hết hôm qua) |
+| Ước tính on-demand EOC | `max(0, projected − included − bonus) × usd_per_unit` |
 
-Các số tiền này là **ước tính**, không thay thế invoice Cursor.
+Mọi số usage (chu kỳ / hôm qua / theo model) **cùng mốc hết hôm qua** từ events — không trộn `plan.used` live.
+
+`days_elapsed` = từ `billingCycleStart` → `report_date` (inclusive).  
+`remaining_days` = sau `report_date` → `billingCycleEnd`.
+
+Các số dự báo là **ước tính**, không thay thế invoice Cursor.
 
 ### Kênh gửi
 

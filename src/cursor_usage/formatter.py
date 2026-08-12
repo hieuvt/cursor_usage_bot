@@ -14,78 +14,51 @@ ALERT_PREFIX = "⚠️ Cursor Usage — CẢNH BÁO"
 def format_report(report: UsageReport) -> str:
     """Build a Vietnamese HTML report for Telegram."""
     lines: list[str] = [
-        f"<b>📊 Cursor Usage — {_esc(report.report_date.isoformat())}</b>",
+        f"<b>Cursor Usage - {_esc(report.report_date.isoformat())}</b>",
+        (
+            f"Chu kỳ: {_fmt_date(report.billing_cycle_start)} - "
+            f"{_fmt_date(report.billing_cycle_end)}"
+        ),
         "",
-        f"🧾 Chu kỳ: {_fmt_dt(report.billing_cycle_start)} → {_fmt_dt(report.billing_cycle_end)}",
-        f"📦 Gói: <code>{_esc(report.membership_type)}</code>",
-        f"🎁 Khuyến mại: {_esc(report.promo_note)}",
+        "<b>--- thông tin gói ---</b>",
+        f"tên gói: <code>{_esc(report.membership_type)}</code>",
+        f"số tiền included: {_fmt_usd(report.included_money_usd)}",
+        f"số plan unit included: {_fmt_units(report.included_plan_units)}",
+        f"tương ứng: {_fmt_usd_per_unit(report.usd_per_plan_unit)} / 1 plan unit",
+        f"số plan unit bonus: {_fmt_units(report.bonus_plan_units)}",
+        "",
+        "<b>--- Tổng số tiền đã tiêu từ đầu chu kỳ ---</b>",
+        f"số plan unit đã dùng từ đầu chu kỳ: {_fmt_units(report.cycle_plan_units)}",
+        f"số tiền đã tiêu từ đầu chu kỳ: {_fmt_usd(report.cycle_spent_usd)}",
+        (
+            f"số plan unit còn trong gói included: "
+            f"{_fmt_units(report.included_remaining_units)}"
+        ),
+        f"số tiền included còn lại: {_fmt_usd(report.included_remaining_usd)}",
+        f"số plan unit còn trong bonus: {_fmt_units(report.bonus_remaining_units)}",
+        f"số tiền on demand đã trả: {_fmt_usd(report.on_demand_usd)}",
+        (
+            f"ước tính số plan unit dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_plan_units)}"
+            f" <i>({report.days_elapsed} ngày đã qua, "
+            f"còn {report.remaining_days} ngày)</i>"
+        ),
+        (
+            f"ước tính số tiền on demand cần trả đến hết chu kỳ: "
+            f"{_fmt_usd(report.estimated_on_demand_eoc_usd)}"
+        ),
+        "",
+        "<b>--- Tổng số tiền đã tiêu ngày hôm qua ---</b>",
+        f"số plan unit đã dùng ngày hôm qua: {_fmt_units(report.yesterday_plan_units)}",
+        f"số tiền đã tiêu ngày hôm qua: {_fmt_usd(report.yesterday_spent_usd)}",
+        "",
+        "<b>--- Chi tiết model được sử dụng ngày hôm qua ---</b>",
+        _format_model_table(report.yesterday),
+        "",
+        "<b>--- Chi tiết model được sử dụng từ đầu chu kỳ ---</b>",
+        _format_model_table(report.cycle_to_date),
     ]
-
-    if report.plan_used is not None or report.plan_limit is not None:
-        used = _fmt_number(report.plan_used) if report.plan_used is not None else "?"
-        limit = _fmt_number(report.plan_limit) if report.plan_limit is not None else "?"
-        lines.append(f"📈 Plan (cycle): {used} / {limit}")
-
-    lines.extend(["", *_format_money_section(report)])
-
-    lines.extend(
-        [
-            "",
-            "<b>—— Hôm qua ——</b>",
-            *_format_model_section(
-                report.yesterday,
-                report.yesterday_total_tokens,
-                report.yesterday_total_cost_usd,
-            ),
-            "",
-            "<b>—— Từ đầu chu kỳ → hết hôm qua ——</b>",
-            *_format_model_section(
-                report.cycle_to_date,
-                report.cycle_total_tokens,
-                report.cycle_total_cost_usd,
-            ),
-        ]
-    )
     return "\n".join(lines)
-
-
-def _format_money_section(report: UsageReport) -> list[str]:
-    """Subscription / promo / on-demand estimates."""
-    bonus_txt = (
-        _fmt_usd(report.promo_bonus_usd)
-        if report.promo_bonus_usd is not None
-        else "Không có"
-    )
-    sub_txt = (
-        _fmt_usd(report.subscription_usd)
-        if report.subscription_usd is not None
-        else "?"
-    )
-    included_txt = (
-        _fmt_usd(report.included_usd)
-        if report.included_usd is not None
-        else "?"
-    )
-
-    sub_plus_promo = None
-    if report.subscription_usd is not None:
-        sub_plus_promo = report.subscription_usd + (report.promo_bonus_usd or 0.0)
-
-    lines = [
-        "<b>💵 Ước tính tiền</b> <i>(1 đơn vị plan ≈ $0.01)</i>",
-        f"• Khuyến mại (bonus): {bonus_txt}",
-        f"• Gói cước (subscription): {sub_txt}",
-        f"• Included kèm gói: {included_txt}",
-    ]
-    if sub_plus_promo is not None:
-        lines.append(
-            f"• Gói cước + khuyến mại: {_fmt_usd(sub_plus_promo)}"
-        )
-    lines.append(f"• On-demand (ước tính): {_fmt_usd(report.on_demand_usd)}")
-    lines.append(
-        f"• Gross usage chu kỳ: {_fmt_usd(report.cycle_total_cost_usd)}"
-    )
-    return lines
 
 
 def format_error_alert(error: BaseException) -> str:
@@ -124,66 +97,96 @@ def format_error_alert(error: BaseException) -> str:
     elif isinstance(error, ConfigError):
         detail = f"Lỗi cấu hình: {_esc(str(error))}"
     else:
-        detail = f"Lỗi không xác định: <code>{_esc(type(error).__name__)}</code> — {_esc(str(error))}"
+        detail = (
+            f"Lỗi không xác định: <code>{_esc(type(error).__name__)}</code> — "
+            f"{_esc(str(error))}"
+        )
 
     return f"<b>{ALERT_PREFIX}</b>\n\n{detail}"
 
 
-def _format_model_section(
-    models: list[ModelUsage],
-    total_tokens: int,
-    total_cost_usd: float,
-) -> list[str]:
+def _format_model_table(models: list[ModelUsage]) -> str:
+    """Render a monospace table (Telegram has no markdown tables)."""
     if not models:
-        return ["Không có usage", f"Tổng: 0 tokens | {_fmt_usd(0)}"]
+        return "<pre>Không có usage</pre>"
 
-    lines: list[str] = []
-    for m in models:
-        lines.append(
-            f"• <code>{_esc(m.model)}</code>: "
-            f"{_fmt_int(m.total_tokens)} tokens | {_fmt_usd(m.cost_usd)}"
+    headers = ("Model", "Tokens", "Plan unit", "USD")
+    rows: list[tuple[str, str, str, str]] = [
+        (
+            m.model,
+            _fmt_int(m.total_tokens),
+            _fmt_units_plain(m.plan_units),
+            _fmt_usd_plain(m.cost_usd),
         )
-        detail_parts: list[str] = []
-        if m.input_tokens or m.output_tokens or m.cache_write_tokens or m.cache_read_tokens:
-            detail_parts.append(
-                f"in {_fmt_int(m.input_tokens)} / out {_fmt_int(m.output_tokens)}"
-            )
-            if m.cache_write_tokens:
-                detail_parts.append(f"cacheW {_fmt_int(m.cache_write_tokens)}")
-            if m.cache_read_tokens:
-                detail_parts.append(f"cacheR {_fmt_int(m.cache_read_tokens)}")
-            detail_parts.append(f"{m.event_count} req")
-            lines.append(f"  <i>{_esc(' · '.join(detail_parts))}</i>")
-
-    lines.append(
-        f"<b>Tổng:</b> {_fmt_int(total_tokens)} tokens | {_fmt_usd(total_cost_usd)}"
+        for m in models
+    ]
+    total_tokens = sum(m.total_tokens for m in models)
+    total_units = sum(m.plan_units for m in models)
+    total_usd = sum(m.cost_usd for m in models)
+    rows.append(
+        (
+            "TỔNG",
+            _fmt_int(total_tokens),
+            _fmt_units_plain(total_units),
+            _fmt_usd_plain(total_usd),
+        )
     )
-    return lines
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells: tuple[str, ...] | list[str]) -> str:
+        return " | ".join(str(cells[i]).ljust(widths[i]) for i in range(4))
+
+    sep = "-+-".join("-" * w for w in widths)
+    lines = [fmt_row(headers), sep, *[fmt_row(r) for r in rows]]
+    return "<pre>" + _esc("\n".join(lines)) + "</pre>"
 
 
-def _fmt_dt(dt: datetime) -> str:
-    return _esc(dt.strftime("%Y-%m-%d %H:%M %Z"))
+def _fmt_date(dt: datetime) -> str:
+    return _esc(dt.strftime("%Y-%m-%d"))
 
 
 def _fmt_int(value: int) -> str:
     return f"{value:,}"
 
 
-def _fmt_number(value: float) -> str:
+def _fmt_units(value: float | None) -> str:
+    if value is None:
+        return "?"
+    return _fmt_units_plain(value)
+
+
+def _fmt_units_plain(value: float) -> str:
     if float(value).is_integer():
-        return _fmt_int(int(value))
+        return f"{int(value):,}"
     return f"{value:,.2f}"
 
 
-def _fmt_usd(value: float) -> str:
+def _fmt_usd(value: float | None) -> str:
+    if value is None:
+        return "?"
+    return _fmt_usd_plain(value)
+
+
+def _fmt_usd_plain(value: float) -> str:
     abs_v = abs(value)
     if abs_v == 0:
         return "$0.00"
     if abs_v < 0.01:
         return f"${value:.4f}"
-    if abs_v < 1:
-        return f"${value:.4f}"
     return f"${value:.2f}"
+
+
+def _fmt_usd_per_unit(value: float | None) -> str:
+    if value is None:
+        return "?"
+    # Show more precision for small rates (e.g. Ultra $200/40000 = $0.005)
+    if abs(value) < 0.01:
+        return f"${value:.4f}"
+    return f"${value:.4f}"
 
 
 def _esc(text: str) -> str:

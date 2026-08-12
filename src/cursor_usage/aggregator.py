@@ -7,10 +7,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-# Plan breakdown units: Pro included 2000 ↔ $20 → 1 unit = $0.01
-PLAN_UNIT_USD = 0.01
-
-# Individual monthly seat prices (USD), keyed by membershipType from usage-summary
+# Individual monthly seat prices (USD), keyed by membershipType from usage-summary.
+# This is "số tiền included" for the plan pool.
 MEMBERSHIP_PRICE_USD: dict[str, float] = {
     "hobby": 0.0,
     "free": 0.0,
@@ -29,6 +27,7 @@ class ModelUsage:
     cache_write_tokens: int
     cache_read_tokens: int
     total_tokens: int
+    plan_units: float
     cost_usd: float
     event_count: int
 
@@ -38,22 +37,28 @@ class UsageReport:
     billing_cycle_start: datetime
     billing_cycle_end: datetime
     membership_type: str
-    promo_bonus: int | None
-    promo_note: str
-    plan_used: float | None
-    plan_limit: float | None
     report_date: date
-    yesterday: list[ModelUsage]
-    yesterday_total_tokens: int
-    yesterday_total_cost_usd: float
-    cycle_to_date: list[ModelUsage]
-    cycle_total_tokens: int
-    cycle_total_cost_usd: float
-    # Money estimates (USD)
-    subscription_usd: float | None
-    included_usd: float | None
-    promo_bonus_usd: float | None
+    # Package
+    included_money_usd: float | None
+    included_plan_units: float | None
+    usd_per_plan_unit: float | None
+    bonus_plan_units: float
+    # Cycle totals (aligned to end of yesterday via events)
+    cycle_plan_units: float
+    cycle_spent_usd: float
+    included_remaining_units: float | None
+    included_remaining_usd: float | None
+    bonus_remaining_units: float
     on_demand_usd: float
+    projected_eoc_plan_units: float | None
+    estimated_on_demand_eoc_usd: float | None
+    days_elapsed: int
+    remaining_days: int
+    # Yesterday
+    yesterday_plan_units: float
+    yesterday_spent_usd: float
+    yesterday: list[ModelUsage]
+    cycle_to_date: list[ModelUsage]
 
 
 @dataclass(frozen=True)
@@ -69,7 +74,7 @@ class ReportWindow:
 
     @property
     def fetch_start_ms(self) -> int:
-        return _to_epoch_ms(self.cycle_start)
+        return _to_epoch_ms(min(self.cycle_start, self.yesterday_start))
 
     @property
     def fetch_end_ms(self) -> int:
@@ -91,11 +96,9 @@ def compute_report_window(
     yesterday_start = datetime(
         report_date.year, report_date.month, report_date.day, 0, 0, 0, 0, tzinfo=tz
     )
-    # Inclusive end of yesterday: 23:59:59.999
     yesterday_end = yesterday_start + timedelta(days=1) - timedelta(milliseconds=1)
 
     cycle_start = _parse_iso_datetime(summary["billingCycleStart"]).astimezone(tz)
-    # Cycle window ends at end of yesterday (not "now")
     cycle_end = yesterday_end
 
     return ReportWindow(
@@ -130,62 +133,125 @@ def build_report(
         if window.yesterday_start <= ts <= window.yesterday_end:
             yesterday_events.append(event)
 
-    yesterday = _aggregate_by_model(yesterday_events)
-    cycle_to_date = _aggregate_by_model(cycle_events)
-
-    promo_bonus, promo_note = _extract_promo(summary)
-    plan_used, plan_limit = _extract_plan_usage(summary)
-    included_units, bonus_units = _extract_plan_breakdown_units(summary)
-
     membership_type = str(summary.get("membershipType") or "unknown")
-    subscription_usd = _subscription_price_usd(membership_type)
-    included_usd = (
-        round(included_units * PLAN_UNIT_USD, 2)
-        if included_units is not None
-        else None
+    included_money_usd = _subscription_price_usd(membership_type)
+    included_plan_units, bonus_plan_units = _extract_pool_units(summary)
+    bonus_used_units = _extract_bonus_used(summary)
+    on_demand_usd = _extract_on_demand_usd(summary) or 0.0
+
+    usd_per_plan_unit: float | None = None
+    if (
+        included_money_usd is not None
+        and included_plan_units is not None
+        and included_plan_units > 0
+    ):
+        usd_per_plan_unit = included_money_usd / included_plan_units
+
+    yesterday = _aggregate_by_model(yesterday_events, usd_per_plan_unit)
+    cycle_to_date = _aggregate_by_model(cycle_events, usd_per_plan_unit)
+
+    cycle_plan_units = round(sum(m.plan_units for m in cycle_to_date), 4)
+    yesterday_plan_units = round(sum(m.plan_units for m in yesterday), 4)
+
+    cycle_spent_usd = (
+        round(cycle_plan_units * usd_per_plan_unit, 2)
+        if usd_per_plan_unit is not None
+        else round(sum(m.cost_usd for m in cycle_to_date), 2)
     )
-    promo_bonus_usd = (
-        round(bonus_units * PLAN_UNIT_USD, 2) if bonus_units is not None else None
+    yesterday_spent_usd = (
+        round(yesterday_plan_units * usd_per_plan_unit, 2)
+        if usd_per_plan_unit is not None
+        else round(sum(m.cost_usd for m in yesterday), 2)
     )
 
-    cycle_total_cost_usd = round(sum(m.cost_usd for m in cycle_to_date), 6)
-    free_pool = (included_usd or 0.0) + (promo_bonus_usd or 0.0)
-    on_demand_api = _extract_on_demand_usd(summary)
-    # Align with cycle-to-date window when we know free pool; else API / gross
-    if included_usd is not None or promo_bonus_usd is not None:
-        on_demand_usd = round(max(0.0, cycle_total_cost_usd - free_pool), 2)
-    elif on_demand_api is not None:
-        on_demand_usd = on_demand_api
-    else:
-        on_demand_usd = round(cycle_total_cost_usd, 2)
+    # Remaining included as of end of yesterday (event-based, not live summary).
+    included_remaining_units: float | None = None
+    included_remaining_usd: float | None = None
+    if included_plan_units is not None:
+        used_from_included = max(0.0, cycle_plan_units - bonus_used_units)
+        included_remaining_units = round(
+            max(0.0, included_plan_units - used_from_included), 4
+        )
+        if usd_per_plan_unit is not None:
+            included_remaining_usd = round(
+                included_remaining_units * usd_per_plan_unit, 2
+            )
+
+    bonus_remaining_units = round(max(0.0, bonus_plan_units - bonus_used_units), 4)
 
     billing_end = _parse_iso_datetime(summary["billingCycleEnd"]).astimezone(
         ZoneInfo(timezone)
     )
+    days_elapsed, remaining_days = _cycle_day_counts(
+        cycle_start=window.cycle_start.date(),
+        report_date=window.report_date,
+        cycle_end=billing_end.date(),
+    )
+    total_cycle_days = days_elapsed + remaining_days
+
+    projected_eoc_plan_units: float | None = None
+    estimated_on_demand_eoc_usd: float | None = None
+    if days_elapsed > 0 and total_cycle_days > 0:
+        avg_daily = cycle_plan_units / days_elapsed
+        projected_eoc_plan_units = round(avg_daily * total_cycle_days, 4)
+
+        total_pool = (included_plan_units or 0.0) + bonus_plan_units
+        if projected_eoc_plan_units is not None and total_pool > 0:
+            overage = max(0.0, projected_eoc_plan_units - total_pool)
+            if usd_per_plan_unit is not None:
+                estimated_on_demand_eoc_usd = round(
+                    max(on_demand_usd, overage * usd_per_plan_unit), 2
+                )
+            else:
+                estimated_on_demand_eoc_usd = round(on_demand_usd, 2)
+        else:
+            estimated_on_demand_eoc_usd = round(on_demand_usd, 2)
 
     return UsageReport(
         billing_cycle_start=window.cycle_start,
         billing_cycle_end=billing_end,
         membership_type=membership_type,
-        promo_bonus=promo_bonus,
-        promo_note=promo_note,
-        plan_used=plan_used,
-        plan_limit=plan_limit,
         report_date=window.report_date,
-        yesterday=yesterday,
-        yesterday_total_tokens=sum(m.total_tokens for m in yesterday),
-        yesterday_total_cost_usd=round(sum(m.cost_usd for m in yesterday), 6),
-        cycle_to_date=cycle_to_date,
-        cycle_total_tokens=sum(m.total_tokens for m in cycle_to_date),
-        cycle_total_cost_usd=cycle_total_cost_usd,
-        subscription_usd=subscription_usd,
-        included_usd=included_usd,
-        promo_bonus_usd=promo_bonus_usd,
+        included_money_usd=included_money_usd,
+        included_plan_units=included_plan_units,
+        usd_per_plan_unit=usd_per_plan_unit,
+        bonus_plan_units=bonus_plan_units,
+        cycle_plan_units=cycle_plan_units,
+        cycle_spent_usd=cycle_spent_usd,
+        included_remaining_units=included_remaining_units,
+        included_remaining_usd=included_remaining_usd,
+        bonus_remaining_units=bonus_remaining_units,
         on_demand_usd=on_demand_usd,
+        projected_eoc_plan_units=projected_eoc_plan_units,
+        estimated_on_demand_eoc_usd=estimated_on_demand_eoc_usd,
+        days_elapsed=days_elapsed,
+        remaining_days=remaining_days,
+        yesterday_plan_units=yesterday_plan_units,
+        yesterday_spent_usd=yesterday_spent_usd,
+        yesterday=yesterday,
+        cycle_to_date=cycle_to_date,
     )
 
 
-def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
+def _cycle_day_counts(
+    *,
+    cycle_start: date,
+    report_date: date,
+    cycle_end: date,
+) -> tuple[int, int]:
+    days_elapsed = (report_date - cycle_start).days + 1
+    if days_elapsed < 1:
+        days_elapsed = 1
+    remaining_days = (cycle_end - report_date).days
+    if remaining_days < 0:
+        remaining_days = 0
+    return days_elapsed, remaining_days
+
+
+def _aggregate_by_model(
+    events: list[dict[str, Any]],
+    usd_per_plan_unit: float | None,
+) -> list[ModelUsage]:
     buckets: dict[str, dict[str, float | int | str]] = {}
 
     for event in events:
@@ -205,10 +271,15 @@ def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
         )
         total_tokens = input_tokens + output_tokens + cache_write + cache_read
 
+        # Cursor meters plan units ≈ chargedCents (raw). Fallback to totalCents.
         cents = event.get("chargedCents")
         if cents is None:
             cents = token_usage.get("totalCents")
-        cost_usd = _as_float(cents) / 100.0
+        plan_units = _as_float(cents)
+        if usd_per_plan_unit is not None:
+            cost_usd = plan_units * usd_per_plan_unit
+        else:
+            cost_usd = plan_units / 100.0
 
         bucket = buckets.setdefault(
             model,
@@ -219,6 +290,7 @@ def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
                 "cache_write_tokens": 0,
                 "cache_read_tokens": 0,
                 "total_tokens": 0,
+                "plan_units": 0.0,
                 "cost_usd": 0.0,
                 "event_count": 0,
             },
@@ -228,6 +300,7 @@ def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
         bucket["cache_write_tokens"] = int(bucket["cache_write_tokens"]) + cache_write
         bucket["cache_read_tokens"] = int(bucket["cache_read_tokens"]) + cache_read
         bucket["total_tokens"] = int(bucket["total_tokens"]) + total_tokens
+        bucket["plan_units"] = float(bucket["plan_units"]) + plan_units
         bucket["cost_usd"] = float(bucket["cost_usd"]) + cost_usd
         bucket["event_count"] = int(bucket["event_count"]) + 1
 
@@ -239,96 +312,63 @@ def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
             cache_write_tokens=int(b["cache_write_tokens"]),
             cache_read_tokens=int(b["cache_read_tokens"]),
             total_tokens=int(b["total_tokens"]),
+            plan_units=round(float(b["plan_units"]), 4),
             cost_usd=round(float(b["cost_usd"]), 6),
             event_count=int(b["event_count"]),
         )
         for b in buckets.values()
     ]
-    usages.sort(key=lambda m: (-m.cost_usd, m.model))
+    usages.sort(key=lambda m: (-m.plan_units, m.model))
     return usages
 
 
-def _extract_promo(summary: dict[str, Any]) -> tuple[int | None, str]:
-    plan = (
-        (summary.get("individualUsage") or {}).get("plan")
-        if isinstance(summary.get("individualUsage"), dict)
-        else None
-    )
-    bonus: int | None = None
-    if isinstance(plan, dict):
-        breakdown = plan.get("breakdown")
-        if isinstance(breakdown, dict) and breakdown.get("bonus") is not None:
-            try:
-                bonus_val = int(breakdown["bonus"])
-                if bonus_val > 0:
-                    bonus = bonus_val
-            except (TypeError, ValueError):
-                bonus = None
-
-    notes: list[str] = []
-    if bonus is not None:
-        notes.append(f"Bonus: {bonus}")
-
-    for key in (
-        "autoModelSelectedDisplayMessage",
-        "namedModelSelectedDisplayMessage",
-    ):
-        msg = summary.get(key)
-        if isinstance(msg, str) and msg.strip():
-            notes.append(msg.strip())
-
-    if not notes:
-        return None, "Không có khuyến mại"
-    return bonus, " | ".join(notes)
-
-
-def _extract_plan_usage(summary: dict[str, Any]) -> tuple[float | None, float | None]:
+def _extract_pool_units(summary: dict[str, Any]) -> tuple[float | None, float]:
+    """Return (included_plan_units pool, bonus_plan_units pool)."""
     individual = summary.get("individualUsage")
     if not isinstance(individual, dict):
-        return None, None
+        return None, 0.0
     plan = individual.get("plan")
     if not isinstance(plan, dict):
-        return None, None
-    used = plan.get("used")
+        return None, 0.0
+
     limit = plan.get("limit")
-    return (
-        _as_float(used) if used is not None else None,
-        _as_float(limit) if limit is not None else None,
-    )
+    included_pool = _as_float(limit) if limit is not None else None
+
+    # Cursor exposes bonus *used* in breakdown.bonus; a separate bonus pool size
+    # is not always present. When bonus used > 0 but no pool field, treat used
+    # as the known bonus allotment floor (remaining may be 0).
+    bonus_pool = 0.0
+    breakdown = plan.get("breakdown")
+    if isinstance(breakdown, dict):
+        # Prefer explicit pool fields if Cursor adds them later.
+        for key in ("bonusLimit", "bonusTotal", "bonus_pool"):
+            if breakdown.get(key) is not None:
+                bonus_pool = _as_float(breakdown[key])
+                break
+        else:
+            bonus_used = _as_float(breakdown.get("bonus"))
+            # If limit already includes bonus, we cannot split cleanly; keep
+            # included = limit and bonus pool = 0 unless bonus used implies allotment.
+            if bonus_used > 0 and bonus_pool == 0.0:
+                bonus_pool = bonus_used
+
+    return included_pool, bonus_pool
 
 
-def _extract_plan_breakdown_units(
-    summary: dict[str, Any],
-) -> tuple[int | None, int | None]:
-    """Return (included_units, bonus_units) from plan.breakdown."""
+def _extract_bonus_used(summary: dict[str, Any]) -> float:
     individual = summary.get("individualUsage")
     if not isinstance(individual, dict):
-        return None, None
+        return 0.0
     plan = individual.get("plan")
     if not isinstance(plan, dict):
-        return None, None
+        return 0.0
     breakdown = plan.get("breakdown")
-    if not isinstance(breakdown, dict):
-        # Fallback: treat plan.limit as included units
-        limit = plan.get("limit")
-        if limit is None:
-            return None, None
-        return _as_int(limit), None
-
-    included: int | None = None
-    bonus: int | None = None
-    if breakdown.get("included") is not None:
-        included = _as_int(breakdown["included"])
-    elif plan.get("limit") is not None:
-        included = _as_int(plan["limit"])
-    if breakdown.get("bonus") is not None:
-        bonus_val = _as_int(breakdown["bonus"])
-        bonus = bonus_val if bonus_val > 0 else None
-    return included, bonus
+    if not isinstance(breakdown, dict) or breakdown.get("bonus") is None:
+        return 0.0
+    return max(0.0, _as_float(breakdown["bonus"]))
 
 
 def _extract_on_demand_usd(summary: dict[str, Any]) -> float | None:
-    """On-demand spend from usage-summary (cents → USD), if present."""
     individual = summary.get("individualUsage")
     if not isinstance(individual, dict):
         return None
@@ -347,7 +387,6 @@ def _subscription_price_usd(membership_type: str) -> float | None:
     key = membership_type.strip().lower().replace(" ", "_").replace("-", "_")
     if key in MEMBERSHIP_PRICE_USD:
         return MEMBERSHIP_PRICE_USD[key]
-    # e.g. "pro_plus" variants
     if "ultra" in key:
         return MEMBERSHIP_PRICE_USD["ultra"]
     if "pro_plus" in key or "proplus" in key or key == "pro+":
