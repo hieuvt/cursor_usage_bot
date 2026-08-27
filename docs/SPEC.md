@@ -137,24 +137,26 @@ Group theo `model`; thiếu model → `"unknown"`.
 
 ### Đơn vị đo & tiền trên báo cáo
 
-**Plan unit** là đơn vị cơ bản (từ event: `chargedCents` raw ≈ 1 plan unit).
+**Plan unit** = `chargedCents` (1 unit ≈ $0.01 giá API). Không quy đổi theo giá ghế / `plan.limit`.
+
+Hai pool độc lập: **Cursor Models** (Grok, Composer, Auto/`default`) và **Other Models** (Claude, GPT, Gemini, …).
 
 | Số trên báo cáo | Cách lấy |
 |-----------------|----------|
-| Số tiền included | Map `membershipType` → giá tháng (pro $20, pro_plus $60, ultra $200) |
-| Số plan unit included | `plan.limit` |
-| USD / 1 plan unit | `included_money / included_plan_units` |
-| Plan unit bonus (pool) | `breakdown.bonus*` nếu có; không có → `0` |
-| Plan unit / tiền đã dùng (chu kỳ, hôm qua) | Cộng `chargedCents` events trong cửa sổ; tiền = `units × usd_per_unit` |
-| Included còn lại | `max(0, included_pool − units_used_from_included)`; tiền = còn lại × `usd_per_unit` |
-| On-demand đã trả | `individualUsage.onDemand.used / 100` |
-| Ước tính EOC units | `avg_daily × tổng_ngày_chu_kỳ` (avg từ units đến hết hôm qua) |
-| Ước tính on-demand EOC | `max(0, projected − included − bonus) × usd_per_unit` |
+| Số tiền included | Map `membershipType` → giá ghế tháng (pro $20, pro_plus $60, ultra $200) |
+| Plan unit Cursor included | `cycle_cursor_units / (autoPercentUsed / 100)` khi có %; không suy ra được → `?` |
+| Plan unit Other included | `plan.limit` (ví dụ Ultra 40000 = $400) |
+| Plan unit Cursor / Other bonus | `breakdown.bonus` gán vào Cursor (API không tách pool); Other = `0` nếu không có field riêng |
+| Plan unit đã dùng (hôm qua / chu kỳ) | Cộng `chargedCents` events, tách theo pool của `model` |
+| % pool | `units_used / included_pool × 100` |
+| Ước tính EOC units | `avg_daily_pool × tổng_ngày_chu_kỳ` (từng pool, từ units đến hết hôm qua) |
+| Ước tính on-demand EOC | Phần vượt Cursor (sau spillover sang Other còn lại) + phần vượt Other; × $0.01. Sàn = `onDemand.used / 100` |
 
 Mọi số usage (chu kỳ / hôm qua / theo model) **cùng mốc hết hôm qua** từ events — không trộn `plan.used` live.
 
-`days_elapsed` = từ `billingCycleStart` → `report_date` (inclusive).  
-`remaining_days` = sau `report_date` → `billingCycleEnd`.
+`days_elapsed` = từ ngày `billingCycleStart` → `report_date` (inclusive).  
+`remaining_days` = sau `report_date` → **ngày trước** `billingCycleEnd` (23:59). Ngày `billingCycleEnd` là lúc reset / bắt đầu chu kỳ sau, không tính vào chu kỳ này.  
+`tổng_ngày_chu_kỳ` = `days_elapsed + remaining_days` = `(billingCycleEnd.date − billingCycleStart.date).days` (ví dụ 4 Aug → 4 Sep = 31, không phải 32).
 
 Các số dự báo là **ước tính**, không thay thế invoice Cursor.
 

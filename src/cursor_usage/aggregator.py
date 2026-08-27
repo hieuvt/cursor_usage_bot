@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 # Individual monthly seat prices (USD), keyed by membershipType from usage-summary.
-# This is "số tiền included" for the plan pool.
 MEMBERSHIP_PRICE_USD: dict[str, float] = {
     "hobby": 0.0,
     "free": 0.0,
@@ -18,17 +17,23 @@ MEMBERSHIP_PRICE_USD: dict[str, float] = {
     "ultra": 200.0,
 }
 
+PoolKind = Literal["Cursor", "Other"]
+
+# 1 plan unit = 1 chargedCent = $0.01 of API-equivalent usage.
+USD_PER_PLAN_UNIT = 0.01
+
 
 @dataclass(frozen=True)
 class ModelUsage:
     model: str
+    pool: PoolKind
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
     cache_read_tokens: int
     total_tokens: int
     plan_units: float
-    cost_usd: float
+    pool_pct: float | None
     event_count: int
 
 
@@ -38,25 +43,24 @@ class UsageReport:
     billing_cycle_end: datetime
     membership_type: str
     report_date: date
-    # Package
     included_money_usd: float | None
-    included_plan_units: float | None
-    usd_per_plan_unit: float | None
-    bonus_plan_units: float
-    # Cycle totals (aligned to end of yesterday via events)
-    cycle_plan_units: float
-    cycle_spent_usd: float
-    included_remaining_units: float | None
-    included_remaining_usd: float | None
-    bonus_remaining_units: float
-    on_demand_usd: float
-    projected_eoc_plan_units: float | None
+    cursor_included_units: float | None
+    other_included_units: float | None
+    cursor_bonus_units: float
+    other_bonus_units: float
+    yesterday_cursor_units: float
+    yesterday_other_units: float
+    yesterday_cursor_pct: float | None
+    yesterday_other_pct: float | None
+    cycle_cursor_units: float
+    cycle_other_units: float
+    cycle_cursor_pct: float | None
+    cycle_other_pct: float | None
+    projected_eoc_cursor_units: float | None
+    projected_eoc_other_units: float | None
     estimated_on_demand_eoc_usd: float | None
     days_elapsed: int
     remaining_days: int
-    # Yesterday
-    yesterday_plan_units: float
-    yesterday_spent_usd: float
     yesterday: list[ModelUsage]
     cycle_to_date: list[ModelUsage]
 
@@ -111,6 +115,18 @@ def compute_report_window(
     )
 
 
+def classify_model_pool(model: str) -> PoolKind:
+    """Map a model id to the Cursor Models or Other Models usage pool."""
+    name = (model or "").strip().lower()
+    if not name or name == "unknown":
+        return "Other"
+    if name in {"default", "auto"} or name.startswith("auto"):
+        return "Cursor"
+    if "composer" in name or "vega" in name or "grok" in name:
+        return "Cursor"
+    return "Other"
+
+
 def build_report(
     summary: dict[str, Any],
     events: list[dict[str, Any]],
@@ -135,49 +151,30 @@ def build_report(
 
     membership_type = str(summary.get("membershipType") or "unknown")
     included_money_usd = _subscription_price_usd(membership_type)
-    included_plan_units, bonus_plan_units = _extract_pool_units(summary)
-    bonus_used_units = _extract_bonus_used(summary)
+    other_included_units = _extract_other_included_units(summary)
+    bonus_used = _extract_bonus_used(summary)
     on_demand_usd = _extract_on_demand_usd(summary) or 0.0
 
-    usd_per_plan_unit: float | None = None
-    if (
-        included_money_usd is not None
-        and included_plan_units is not None
-        and included_plan_units > 0
-    ):
-        usd_per_plan_unit = included_money_usd / included_plan_units
+    yesterday_raw = _aggregate_by_model(yesterday_events)
+    cycle_raw = _aggregate_by_model(cycle_events)
 
-    yesterday = _aggregate_by_model(yesterday_events, usd_per_plan_unit)
-    cycle_to_date = _aggregate_by_model(cycle_events, usd_per_plan_unit)
+    yesterday_cursor_units = _sum_pool(yesterday_raw, "Cursor")
+    yesterday_other_units = _sum_pool(yesterday_raw, "Other")
+    cycle_cursor_units = _sum_pool(cycle_raw, "Cursor")
+    cycle_other_units = _sum_pool(cycle_raw, "Other")
 
-    cycle_plan_units = round(sum(m.plan_units for m in cycle_to_date), 4)
-    yesterday_plan_units = round(sum(m.plan_units for m in yesterday), 4)
+    cursor_included_units = _infer_cursor_included_units(summary, cycle_cursor_units)
+    # API exposes a single bonus used figure, not a per-pool bonus grant.
+    cursor_bonus_units = bonus_used
+    other_bonus_units = 0.0
 
-    cycle_spent_usd = (
-        round(cycle_plan_units * usd_per_plan_unit, 2)
-        if usd_per_plan_unit is not None
-        else round(sum(m.cost_usd for m in cycle_to_date), 2)
-    )
-    yesterday_spent_usd = (
-        round(yesterday_plan_units * usd_per_plan_unit, 2)
-        if usd_per_plan_unit is not None
-        else round(sum(m.cost_usd for m in yesterday), 2)
-    )
+    yesterday_cursor_pct = _pct_of_pool(yesterday_cursor_units, cursor_included_units)
+    yesterday_other_pct = _pct_of_pool(yesterday_other_units, other_included_units)
+    cycle_cursor_pct = _pct_of_pool(cycle_cursor_units, cursor_included_units)
+    cycle_other_pct = _pct_of_pool(cycle_other_units, other_included_units)
 
-    # Remaining included as of end of yesterday (event-based, not live summary).
-    included_remaining_units: float | None = None
-    included_remaining_usd: float | None = None
-    if included_plan_units is not None:
-        used_from_included = max(0.0, cycle_plan_units - bonus_used_units)
-        included_remaining_units = round(
-            max(0.0, included_plan_units - used_from_included), 4
-        )
-        if usd_per_plan_unit is not None:
-            included_remaining_usd = round(
-                included_remaining_units * usd_per_plan_unit, 2
-            )
-
-    bonus_remaining_units = round(max(0.0, bonus_plan_units - bonus_used_units), 4)
+    yesterday = _with_pool_pct(yesterday_raw, cursor_included_units, other_included_units)
+    cycle_to_date = _with_pool_pct(cycle_raw, cursor_included_units, other_included_units)
 
     billing_end = _parse_iso_datetime(summary["billingCycleEnd"]).astimezone(
         ZoneInfo(timezone)
@@ -189,23 +186,25 @@ def build_report(
     )
     total_cycle_days = days_elapsed + remaining_days
 
-    projected_eoc_plan_units: float | None = None
+    projected_eoc_cursor_units: float | None = None
+    projected_eoc_other_units: float | None = None
     estimated_on_demand_eoc_usd: float | None = None
     if days_elapsed > 0 and total_cycle_days > 0:
-        avg_daily = cycle_plan_units / days_elapsed
-        projected_eoc_plan_units = round(avg_daily * total_cycle_days, 4)
-
-        total_pool = (included_plan_units or 0.0) + bonus_plan_units
-        if projected_eoc_plan_units is not None and total_pool > 0:
-            overage = max(0.0, projected_eoc_plan_units - total_pool)
-            if usd_per_plan_unit is not None:
-                estimated_on_demand_eoc_usd = round(
-                    max(on_demand_usd, overage * usd_per_plan_unit), 2
-                )
-            else:
-                estimated_on_demand_eoc_usd = round(on_demand_usd, 2)
-        else:
-            estimated_on_demand_eoc_usd = round(on_demand_usd, 2)
+        projected_eoc_cursor_units = round(
+            (cycle_cursor_units / days_elapsed) * total_cycle_days, 4
+        )
+        projected_eoc_other_units = round(
+            (cycle_other_units / days_elapsed) * total_cycle_days, 4
+        )
+        estimated_on_demand_eoc_usd = _estimate_on_demand_eoc(
+            projected_cursor=projected_eoc_cursor_units,
+            projected_other=projected_eoc_other_units,
+            cursor_included=cursor_included_units,
+            other_included=other_included_units,
+            cursor_bonus=cursor_bonus_units,
+            other_bonus=other_bonus_units,
+            on_demand_already_usd=on_demand_usd,
+        )
 
     return UsageReport(
         billing_cycle_start=window.cycle_start,
@@ -213,21 +212,23 @@ def build_report(
         membership_type=membership_type,
         report_date=window.report_date,
         included_money_usd=included_money_usd,
-        included_plan_units=included_plan_units,
-        usd_per_plan_unit=usd_per_plan_unit,
-        bonus_plan_units=bonus_plan_units,
-        cycle_plan_units=cycle_plan_units,
-        cycle_spent_usd=cycle_spent_usd,
-        included_remaining_units=included_remaining_units,
-        included_remaining_usd=included_remaining_usd,
-        bonus_remaining_units=bonus_remaining_units,
-        on_demand_usd=on_demand_usd,
-        projected_eoc_plan_units=projected_eoc_plan_units,
+        cursor_included_units=cursor_included_units,
+        other_included_units=other_included_units,
+        cursor_bonus_units=cursor_bonus_units,
+        other_bonus_units=other_bonus_units,
+        yesterday_cursor_units=yesterday_cursor_units,
+        yesterday_other_units=yesterday_other_units,
+        yesterday_cursor_pct=yesterday_cursor_pct,
+        yesterday_other_pct=yesterday_other_pct,
+        cycle_cursor_units=cycle_cursor_units,
+        cycle_other_units=cycle_other_units,
+        cycle_cursor_pct=cycle_cursor_pct,
+        cycle_other_pct=cycle_other_pct,
+        projected_eoc_cursor_units=projected_eoc_cursor_units,
+        projected_eoc_other_units=projected_eoc_other_units,
         estimated_on_demand_eoc_usd=estimated_on_demand_eoc_usd,
         days_elapsed=days_elapsed,
         remaining_days=remaining_days,
-        yesterday_plan_units=yesterday_plan_units,
-        yesterday_spent_usd=yesterday_spent_usd,
         yesterday=yesterday,
         cycle_to_date=cycle_to_date,
     )
@@ -239,25 +240,35 @@ def _cycle_day_counts(
     report_date: date,
     cycle_end: date,
 ) -> tuple[int, int]:
-    days_elapsed = (report_date - cycle_start).days + 1
-    if days_elapsed < 1:
-        days_elapsed = 1
-    remaining_days = (cycle_end - report_date).days
-    if remaining_days < 0:
-        remaining_days = 0
+    """Count calendar days in the cycle, excluding the reset date.
+
+    ``cycle_end`` is Cursor's billingCycleEnd (the instant the next cycle
+    starts). The last full day of *this* cycle is the day before that date,
+    through 23:59. Start date stays inclusive — usage on signup day is real.
+    """
+    last_full_day = cycle_end - timedelta(days=1)
+    if last_full_day < cycle_start:
+        last_full_day = cycle_start
+
+    clamped = report_date
+    if clamped < cycle_start:
+        clamped = cycle_start
+    if clamped > last_full_day:
+        clamped = last_full_day
+
+    days_elapsed = (clamped - cycle_start).days + 1
+    remaining_days = (last_full_day - clamped).days
     return days_elapsed, remaining_days
 
 
-def _aggregate_by_model(
-    events: list[dict[str, Any]],
-    usd_per_plan_unit: float | None,
-) -> list[ModelUsage]:
+def _aggregate_by_model(events: list[dict[str, Any]]) -> list[ModelUsage]:
     buckets: dict[str, dict[str, float | int | str]] = {}
 
     for event in events:
         model = event.get("model")
         if not model or not isinstance(model, str):
             model = "unknown"
+        pool = classify_model_pool(model)
 
         token_usage = event.get("tokenUsage")
         if not isinstance(token_usage, dict):
@@ -271,27 +282,22 @@ def _aggregate_by_model(
         )
         total_tokens = input_tokens + output_tokens + cache_write + cache_read
 
-        # Cursor meters plan units ≈ chargedCents (raw). Fallback to totalCents.
         cents = event.get("chargedCents")
         if cents is None:
             cents = token_usage.get("totalCents")
         plan_units = _as_float(cents)
-        if usd_per_plan_unit is not None:
-            cost_usd = plan_units * usd_per_plan_unit
-        else:
-            cost_usd = plan_units / 100.0
 
         bucket = buckets.setdefault(
             model,
             {
                 "model": model,
+                "pool": pool,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_write_tokens": 0,
                 "cache_read_tokens": 0,
                 "total_tokens": 0,
                 "plan_units": 0.0,
-                "cost_usd": 0.0,
                 "event_count": 0,
             },
         )
@@ -301,19 +307,19 @@ def _aggregate_by_model(
         bucket["cache_read_tokens"] = int(bucket["cache_read_tokens"]) + cache_read
         bucket["total_tokens"] = int(bucket["total_tokens"]) + total_tokens
         bucket["plan_units"] = float(bucket["plan_units"]) + plan_units
-        bucket["cost_usd"] = float(bucket["cost_usd"]) + cost_usd
         bucket["event_count"] = int(bucket["event_count"]) + 1
 
     usages = [
         ModelUsage(
             model=str(b["model"]),
+            pool=b["pool"] if b["pool"] in ("Cursor", "Other") else "Other",
             input_tokens=int(b["input_tokens"]),
             output_tokens=int(b["output_tokens"]),
             cache_write_tokens=int(b["cache_write_tokens"]),
             cache_read_tokens=int(b["cache_read_tokens"]),
             total_tokens=int(b["total_tokens"]),
             plan_units=round(float(b["plan_units"]), 4),
-            cost_usd=round(float(b["cost_usd"]), 6),
+            pool_pct=None,
             event_count=int(b["event_count"]),
         )
         for b in buckets.values()
@@ -322,45 +328,71 @@ def _aggregate_by_model(
     return usages
 
 
-def _extract_pool_units(summary: dict[str, Any]) -> tuple[float | None, float]:
-    """Return (included_plan_units pool, bonus_plan_units pool)."""
-    individual = summary.get("individualUsage")
-    if not isinstance(individual, dict):
-        return None, 0.0
-    plan = individual.get("plan")
-    if not isinstance(plan, dict):
-        return None, 0.0
+def _with_pool_pct(
+    models: list[ModelUsage],
+    cursor_included: float | None,
+    other_included: float | None,
+) -> list[ModelUsage]:
+    result: list[ModelUsage] = []
+    for m in models:
+        pool_size = cursor_included if m.pool == "Cursor" else other_included
+        result.append(
+            ModelUsage(
+                model=m.model,
+                pool=m.pool,
+                input_tokens=m.input_tokens,
+                output_tokens=m.output_tokens,
+                cache_write_tokens=m.cache_write_tokens,
+                cache_read_tokens=m.cache_read_tokens,
+                total_tokens=m.total_tokens,
+                plan_units=m.plan_units,
+                pool_pct=_pct_of_pool(m.plan_units, pool_size),
+                event_count=m.event_count,
+            )
+        )
+    return result
 
+
+def _sum_pool(models: list[ModelUsage], pool: PoolKind) -> float:
+    return round(sum(m.plan_units for m in models if m.pool == pool), 4)
+
+
+def _pct_of_pool(used: float, included: float | None) -> float | None:
+    if included is None or included <= 0:
+        return None
+    return round(used / included * 100.0, 4)
+
+
+def _infer_cursor_included_units(
+    summary: dict[str, Any], cycle_cursor_units: float
+) -> float | None:
+    """Infer Cursor Models included pool from autoPercentUsed + event usage."""
+    plan = _plan_dict(summary)
+    if plan is None:
+        return None
+    auto_pct = plan.get("autoPercentUsed")
+    if auto_pct is None:
+        return None
+    pct = _as_float(auto_pct)
+    if pct <= 0 or cycle_cursor_units <= 0:
+        return None
+    return round(cycle_cursor_units / (pct / 100.0), 4)
+
+
+def _extract_other_included_units(summary: dict[str, Any]) -> float | None:
+    """Other Models included pool: plan.limit (API cents, e.g. Ultra 40000 = $400)."""
+    plan = _plan_dict(summary)
+    if plan is None:
+        return None
     limit = plan.get("limit")
-    included_pool = _as_float(limit) if limit is not None else None
-
-    # Cursor exposes bonus *used* in breakdown.bonus; a separate bonus pool size
-    # is not always present. When bonus used > 0 but no pool field, treat used
-    # as the known bonus allotment floor (remaining may be 0).
-    bonus_pool = 0.0
-    breakdown = plan.get("breakdown")
-    if isinstance(breakdown, dict):
-        # Prefer explicit pool fields if Cursor adds them later.
-        for key in ("bonusLimit", "bonusTotal", "bonus_pool"):
-            if breakdown.get(key) is not None:
-                bonus_pool = _as_float(breakdown[key])
-                break
-        else:
-            bonus_used = _as_float(breakdown.get("bonus"))
-            # If limit already includes bonus, we cannot split cleanly; keep
-            # included = limit and bonus pool = 0 unless bonus used implies allotment.
-            if bonus_used > 0 and bonus_pool == 0.0:
-                bonus_pool = bonus_used
-
-    return included_pool, bonus_pool
+    if limit is None:
+        return None
+    return _as_float(limit)
 
 
 def _extract_bonus_used(summary: dict[str, Any]) -> float:
-    individual = summary.get("individualUsage")
-    if not isinstance(individual, dict):
-        return 0.0
-    plan = individual.get("plan")
-    if not isinstance(plan, dict):
+    plan = _plan_dict(summary)
+    if plan is None:
         return 0.0
     breakdown = plan.get("breakdown")
     if not isinstance(breakdown, dict) or breakdown.get("bonus") is None:
@@ -381,6 +413,39 @@ def _extract_on_demand_usd(summary: dict[str, Any]) -> float | None:
     if used is None:
         return None
     return round(_as_float(used) / 100.0, 2)
+
+
+def _estimate_on_demand_eoc(
+    *,
+    projected_cursor: float,
+    projected_other: float,
+    cursor_included: float | None,
+    other_included: float | None,
+    cursor_bonus: float,
+    other_bonus: float,
+    on_demand_already_usd: float,
+) -> float:
+    """USD on-demand if each pool's run-rate continues; Cursor overage may spill into Other."""
+    cursor_budget = (cursor_included or 0.0) + cursor_bonus
+    other_budget = (other_included or 0.0) + other_bonus
+
+    cursor_over = max(0.0, projected_cursor - cursor_budget) if cursor_budget > 0 else 0.0
+    other_over = max(0.0, projected_other - other_budget) if other_budget > 0 else 0.0
+    other_left = max(0.0, other_budget - projected_other) if other_budget > 0 else 0.0
+    spilled = min(cursor_over, other_left)
+    overage_units = cursor_over - spilled + other_over
+    projected_usd = round(overage_units * USD_PER_PLAN_UNIT, 2)
+    return round(max(on_demand_already_usd, projected_usd), 2)
+
+
+def _plan_dict(summary: dict[str, Any]) -> dict[str, Any] | None:
+    individual = summary.get("individualUsage")
+    if not isinstance(individual, dict):
+        return None
+    plan = individual.get("plan")
+    if not isinstance(plan, dict):
+        return None
+    return plan
 
 
 def _subscription_price_usd(membership_type: str) -> float | None:

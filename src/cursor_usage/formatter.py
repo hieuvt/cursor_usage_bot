@@ -23,34 +23,66 @@ def format_report(report: UsageReport) -> str:
         "<b>--- thông tin gói ---</b>",
         f"tên gói: <code>{_esc(report.membership_type)}</code>",
         f"số tiền included: {_fmt_usd(report.included_money_usd)}",
-        f"số plan unit included: {_fmt_units(report.included_plan_units)}",
-        f"tương ứng: {_fmt_usd_per_unit(report.usd_per_plan_unit)} / 1 plan unit",
-        f"số plan unit bonus: {_fmt_units(report.bonus_plan_units)}",
+        (
+            f"số plan unit Cursor models included: "
+            f"{_fmt_units(report.cursor_included_units)}"
+        ),
+        (
+            f"số plan unit Other models included: "
+            f"{_fmt_units(report.other_included_units)}"
+        ),
+        f"số plan unit Cursor models bonus: {_fmt_units(report.cursor_bonus_units)}",
+        f"số plan unit Other models bonus: {_fmt_units(report.other_bonus_units)}",
+        "",
+        "<b>--- Tổng số tiền đã tiêu ngày hôm qua ---</b>",
+        (
+            f"số plan unit Cursor models đã dùng ngày hôm qua: "
+            f"{_fmt_units(report.yesterday_cursor_units)}"
+        ),
+        (
+            f"%  plan unit Cursor models đã dùng ngày hôm qua: "
+            f"{_fmt_pct(report.yesterday_cursor_pct)}"
+        ),
+        (
+            f"số plan unit Other models đã dùng ngày hôm qua: "
+            f"{_fmt_units(report.yesterday_other_units)}"
+        ),
+        (
+            f"%  plan unit Other models đã dùng ngày hôm qua: "
+            f"{_fmt_pct(report.yesterday_other_pct)}"
+        ),
         "",
         "<b>--- Tổng số tiền đã tiêu từ đầu chu kỳ ---</b>",
-        f"số plan unit đã dùng từ đầu chu kỳ: {_fmt_units(report.cycle_plan_units)}",
-        f"số tiền đã tiêu từ đầu chu kỳ: {_fmt_usd(report.cycle_spent_usd)}",
         (
-            f"số plan unit còn trong gói included: "
-            f"{_fmt_units(report.included_remaining_units)}"
+            f"số plan unit Cursor models đã dùng từ đầu chu kỳ: "
+            f"{_fmt_units(report.cycle_cursor_units)}"
         ),
-        f"số tiền included còn lại: {_fmt_usd(report.included_remaining_usd)}",
-        f"số plan unit còn trong bonus: {_fmt_units(report.bonus_remaining_units)}",
-        f"số tiền on demand đã trả: {_fmt_usd(report.on_demand_usd)}",
         (
-            f"ước tính số plan unit dùng đến hết chu kỳ: "
-            f"{_fmt_units(report.projected_eoc_plan_units)}"
+            f"%  plan unit Cursor models đã dùng từ đầu chu kỳ: "
+            f"{_fmt_pct(report.cycle_cursor_pct)}"
+        ),
+        (
+            f"số plan unit Other models đã dùng từ đầu chu kỳ: "
+            f"{_fmt_units(report.cycle_other_units)}"
+        ),
+        (
+            f"%  plan unit Other models đã dùng từ đầu chu kỳ: "
+            f"{_fmt_pct(report.cycle_other_pct)}"
+        ),
+        (
+            f"ước tính số plan unit Cursor models sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_cursor_units)}"
             f" <i>({report.days_elapsed} ngày đã qua, "
             f"còn {report.remaining_days} ngày)</i>"
         ),
         (
-            f"ước tính số tiền on demand cần trả đến hết chu kỳ: "
+            f"ước tính số plan unit Other models sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_other_units)}"
+        ),
+        (
+            f"ước tính số tiền on-demand phải trả cuối chu kỳ: "
             f"{_fmt_usd(report.estimated_on_demand_eoc_usd)}"
         ),
-        "",
-        "<b>--- Tổng số tiền đã tiêu ngày hôm qua ---</b>",
-        f"số plan unit đã dùng ngày hôm qua: {_fmt_units(report.yesterday_plan_units)}",
-        f"số tiền đã tiêu ngày hôm qua: {_fmt_usd(report.yesterday_spent_usd)}",
         "",
         "<b>--- Chi tiết model được sử dụng ngày hôm qua ---</b>",
         _format_model_table(report.yesterday),
@@ -110,25 +142,26 @@ def _format_model_table(models: list[ModelUsage]) -> str:
     if not models:
         return "<pre>Không có usage</pre>"
 
-    headers = ("Model", "Tokens", "Plan unit", "USD")
-    rows: list[tuple[str, str, str, str]] = [
+    headers = ("Model", "Loại", "Tokens", "Plan unit", "% pool")
+    rows: list[tuple[str, str, str, str, str]] = [
         (
             m.model,
+            m.pool,
             _fmt_int(m.total_tokens),
             _fmt_units_plain(m.plan_units),
-            _fmt_usd_plain(m.cost_usd),
+            _fmt_pct_plain(m.pool_pct),
         )
         for m in models
     ]
     total_tokens = sum(m.total_tokens for m in models)
     total_units = sum(m.plan_units for m in models)
-    total_usd = sum(m.cost_usd for m in models)
     rows.append(
         (
             "TỔNG",
+            "",
             _fmt_int(total_tokens),
             _fmt_units_plain(total_units),
-            _fmt_usd_plain(total_usd),
+            "",
         )
     )
 
@@ -138,7 +171,7 @@ def _format_model_table(models: list[ModelUsage]) -> str:
             widths[i] = max(widths[i], len(cell))
 
     def fmt_row(cells: tuple[str, ...] | list[str]) -> str:
-        return " | ".join(str(cells[i]).ljust(widths[i]) for i in range(4))
+        return " | ".join(str(cells[i]).ljust(widths[i]) for i in range(5))
 
     sep = "-+-".join("-" * w for w in widths)
     lines = [fmt_row(headers), sep, *[fmt_row(r) for r in rows]]
@@ -180,13 +213,16 @@ def _fmt_usd_plain(value: float) -> str:
     return f"${value:.2f}"
 
 
-def _fmt_usd_per_unit(value: float | None) -> str:
+def _fmt_pct(value: float | None) -> str:
     if value is None:
         return "?"
-    # Show more precision for small rates (e.g. Ultra $200/40000 = $0.005)
-    if abs(value) < 0.01:
-        return f"${value:.4f}"
-    return f"${value:.4f}"
+    return _fmt_pct_plain(value)
+
+
+def _fmt_pct_plain(value: float | None) -> str:
+    if value is None:
+        return "?"
+    return f"{value:.1f}%"
 
 
 def _esc(text: str) -> str:

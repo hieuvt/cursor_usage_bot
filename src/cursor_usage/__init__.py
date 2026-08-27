@@ -5,6 +5,7 @@ from cursor_usage.aggregator import (
     ReportWindow,
     UsageReport,
     build_report,
+    classify_model_pool,
     compute_report_window,
 )
 from cursor_usage.config import AppConfig, ConfigError, load_config
@@ -31,6 +32,7 @@ __all__ = [
     "TelegramError",
     "UsageReport",
     "build_report",
+    "classify_model_pool",
     "compute_report_window",
     "format_error_alert",
     "format_report",
