@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+import time
+
 import httpx
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+TELEGRAM_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 class TelegramError(Exception):
@@ -82,6 +88,30 @@ def _send_chunk(
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    last_error: TelegramError | None = None
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            return _post_send_message(client, url, payload)
+        except TelegramError as exc:
+            last_error = exc
+            if attempt >= TELEGRAM_MAX_ATTEMPTS or not _is_retryable(exc):
+                raise
+            delay = TELEGRAM_RETRY_BACKOFF_SECONDS[attempt - 1]
+            print(
+                f"WARN: Telegram send failed (attempt {attempt}/{TELEGRAM_MAX_ATTEMPTS}): "
+                f"{exc}; retry in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def _post_send_message(
+    client: httpx.Client,
+    url: str,
+    payload: dict[str, object],
+) -> None:
     try:
         response = client.post(url, json=payload)
     except httpx.TimeoutException as exc:
@@ -108,8 +138,17 @@ def _send_chunk(
 
     if not data.get("ok"):
         desc = data.get("description") or body[:300]
+        error_code = data.get("error_code")
+        status = error_code if isinstance(error_code, int) else response.status_code
         raise TelegramError(
             f"Telegram API error: {desc}",
-            status_code=response.status_code,
+            status_code=status,
             response_body=body,
         )
+
+
+def _is_retryable(exc: TelegramError) -> bool:
+    msg = str(exc).lower()
+    if "timeout" in msg or "network error" in msg:
+        return True
+    return exc.status_code in TELEGRAM_RETRYABLE_STATUS

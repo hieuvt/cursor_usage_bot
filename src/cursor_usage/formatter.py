@@ -7,6 +7,7 @@ from datetime import datetime
 from cursor_usage.aggregator import ModelUsage, UsageReport
 from cursor_usage.config import ConfigError
 from cursor_usage.cursor_client import CursorAPIError, CursorAuthError, CursorSchemaError
+from cursor_usage.telegram_sender import TelegramError
 
 ALERT_PREFIX = "⚠️ Cursor Usage — CẢNH BÁO"
 
@@ -34,7 +35,7 @@ def format_report(report: UsageReport) -> str:
         f"số plan unit Cursor models bonus: {_fmt_units(report.cursor_bonus_units)}",
         f"số plan unit Other models bonus: {_fmt_units(report.other_bonus_units)}",
         "",
-        "<b>--- Tổng số tiền đã tiêu ngày hôm qua ---</b>",
+        "<b>--- Tổng số plan unit đã dùng ngày hôm qua ---</b>",
         (
             f"số plan unit Cursor models đã dùng ngày hôm qua: "
             f"{_fmt_units(report.yesterday_cursor_units)}"
@@ -52,7 +53,7 @@ def format_report(report: UsageReport) -> str:
             f"{_fmt_pct(report.yesterday_other_pct)}"
         ),
         "",
-        "<b>--- Tổng số tiền đã tiêu từ đầu chu kỳ ---</b>",
+        "<b>--- Tổng số plan unit đã dùng từ đầu chu kỳ ---</b>",
         (
             f"số plan unit Cursor models đã dùng từ đầu chu kỳ: "
             f"{_fmt_units(report.cycle_cursor_units)}"
@@ -79,10 +80,9 @@ def format_report(report: UsageReport) -> str:
             f"ước tính số plan unit Other models sẽ dùng đến hết chu kỳ: "
             f"{_fmt_units(report.projected_eoc_other_units)}"
         ),
-        (
-            f"ước tính số tiền on-demand phải trả cuối chu kỳ: "
-            f"{_fmt_usd(report.estimated_on_demand_eoc_usd)}"
-        ),
+        "",
+        "<b>--- Ước tính số tiền on-demand phải trả cuối chu kỳ ---</b>",
+        _fmt_usd(report.estimated_on_demand_eoc_usd),
         "",
         "<b>--- Chi tiết model được sử dụng ngày hôm qua ---</b>",
         _format_model_table(report.yesterday),
@@ -128,6 +128,12 @@ def format_error_alert(error: BaseException) -> str:
             )
     elif isinstance(error, ConfigError):
         detail = f"Lỗi cấu hình: {_esc(str(error))}"
+    elif isinstance(error, TelegramError):
+        detail = (
+            "Không gửi được báo cáo qua Telegram (timeout/mạng hoặc API).\n"
+            f"Chi tiết: {_esc(str(error))}\n"
+            "Có thể chạy lại: <code>python -m cursor_usage --config config.yaml</code>"
+        )
     else:
         detail = (
             f"Lỗi không xác định: <code>{_esc(type(error).__name__)}</code> — "
