@@ -10,6 +10,8 @@ import httpx
 BASE_URL = "https://cursor.com"
 USAGE_SUMMARY_PATH = "/api/usage-summary"
 FILTERED_EVENTS_PATH = "/api/dashboard/get-filtered-usage-events"
+CURRENT_PERIOD_PATH = "/api/dashboard/get-current-period-usage"
+AGGREGATED_USAGE_PATH = "/api/dashboard/get-aggregated-usage-events"
 ORIGIN = "https://cursor.com"
 
 
@@ -75,6 +77,48 @@ class CursorClient:
                     endpoint=USAGE_SUMMARY_PATH,
                 )
         return data
+
+    def get_current_period_usage(self) -> dict[str, Any]:
+        """POST /api/dashboard/get-current-period-usage — pool percents the dashboard shows."""
+        data = self._request_json("POST", CURRENT_PERIOD_PATH, json={})
+        plan = data.get("planUsage")
+        if not isinstance(plan, dict):
+            raise CursorSchemaError(
+                "current-period-usage missing 'planUsage' "
+                "(dashboard API may have changed)",
+                endpoint=CURRENT_PERIOD_PATH,
+            )
+        for field in (
+            "totalSpend",
+            "autoPercentUsed",
+            "apiPercentUsed",
+            "totalPercentUsed",
+        ):
+            if field not in plan:
+                raise CursorSchemaError(
+                    f"planUsage missing required field '{field}' "
+                    "(dashboard API may have changed)",
+                    endpoint=CURRENT_PERIOD_PATH,
+                )
+        return data
+
+    def get_aggregated_usage(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        """POST aggregated usage for [start_ms, end_ms]. Rows include the dashboard tier."""
+        if start_ms > end_ms:
+            raise ValueError("start_ms must be <= end_ms")
+        data = self._request_json(
+            "POST",
+            AGGREGATED_USAGE_PATH,
+            json={"startDate": start_ms, "endDate": end_ms},
+        )
+        rows = data.get("aggregations")
+        if not isinstance(rows, list):
+            raise CursorSchemaError(
+                "aggregated-usage-events missing 'aggregations' "
+                "(dashboard API may have changed)",
+                endpoint=AGGREGATED_USAGE_PATH,
+            )
+        return [row for row in rows if isinstance(row, dict)]
 
     def iter_usage_events(
         self,

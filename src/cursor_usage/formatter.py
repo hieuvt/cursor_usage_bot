@@ -52,6 +52,14 @@ def format_report(report: UsageReport) -> str:
             f"%  plan unit Other models đã dùng ngày hôm qua: "
             f"{_fmt_pct(report.yesterday_other_pct)}"
         ),
+        (
+            f"số plan unit on-demand đã dùng ngày hôm qua: "
+            f"{_fmt_units(report.yesterday_on_demand_units)}"
+        ),
+        (
+            f"%  plan unit on-demand đã dùng ngày hôm qua: "
+            f"{_fmt_pct(report.yesterday_on_demand_pct)}"
+        ),
         "",
         "<b>--- Tổng số plan unit đã dùng từ đầu chu kỳ ---</b>",
         (
@@ -69,6 +77,18 @@ def format_report(report: UsageReport) -> str:
         (
             f"%  plan unit Other models đã dùng từ đầu chu kỳ: "
             f"{_fmt_pct(report.cycle_other_pct)}"
+        ),
+        (
+            f"số plan unit on-demand đã dùng từ đầu chu kỳ: "
+            f"{_fmt_units(report.cycle_on_demand_units)}"
+        ),
+        (
+            f"%  plan unit on-demand đã dùng từ đầu chu kỳ: "
+            f"{_fmt_pct(report.cycle_on_demand_pct)}"
+        ),
+        (
+            f"ước tính số plan unit on-demand sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_on_demand_units)}"
         ),
         (
             f"ước tính số plan unit Cursor models sẽ dùng đến hết chu kỳ: "

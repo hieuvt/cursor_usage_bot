@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from cursor_usage.aggregator import build_report, compute_report_window
 from cursor_usage.config import AppConfig, ConfigError, load_config
@@ -64,18 +66,46 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _build_daily_message(cfg: AppConfig) -> str:
+    now = datetime.now(ZoneInfo(cfg.cursor.timezone))
     with CursorClient(cfg.cursor.session_token) as client:
         summary = client.get_usage_summary()
-        window = compute_report_window(summary, timezone_name=cfg.cursor.timezone)
-        events = list(
-            client.iter_usage_events(window.fetch_start_ms, window.fetch_end_ms)
+        window = compute_report_window(
+            summary, timezone_name=cfg.cursor.timezone, now=now
+        )
+        period_usage = client.get_current_period_usage()
+        yesterday_aggregations = client.get_aggregated_usage(
+            _epoch_ms(window.yesterday_start),
+            _epoch_ms(window.yesterday_end),
+        )
+        projection_aggregations = client.get_aggregated_usage(
+            window.fetch_start_ms,
+            window.fetch_end_ms,
+        )
+        cycle_aggregations = client.get_aggregated_usage(
+            _epoch_ms(window.cycle_start),
+            _epoch_ms(now),
+        )
+        usage_events = list(
+            client.iter_usage_events(
+                _epoch_ms(window.cycle_start),
+                _epoch_ms(now),
+            )
         )
     report = build_report(
         summary,
-        events,
+        period_usage=period_usage,
+        yesterday_aggregations=yesterday_aggregations,
+        cycle_aggregations=cycle_aggregations,
+        projection_aggregations=projection_aggregations,
         timezone=cfg.cursor.timezone,
+        now=now,
+        usage_events=usage_events,
     )
     return format_report(report)
+
+
+def _epoch_ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
 
 
 def _handle_failure(
