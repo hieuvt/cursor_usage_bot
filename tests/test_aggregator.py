@@ -134,9 +134,9 @@ class PoolTests(unittest.TestCase):
         self.assertIn(("cursor-grok-4.6-high", "Other"), pools)
         self.assertIn(("grok-4.7-high", "Other"), pools)
 
-        # 24 days of combined usage, extrapolated to 30, cannot stay in Cursor.
-        # Cursor stops at 120,000. The overflow fills Other to 11,000.
-        # The rest is on-demand: (34,066.65 - 11,000) = 23,066.65 unit = $230.67.
+        # 123,253.32 used over 24 days, extrapolated to 30 = 154,066.65.
+        # Cursor takes 120,000, Other takes 11,000, on-demand is the rest.
+        self.assertEqual(report.projected_eoc_total_units, 154_066.65)
         self.assertEqual(report.projected_eoc_cursor_units, 120_000)
         self.assertEqual(report.projected_eoc_other_units, 11_000)
         self.assertEqual(report.yesterday_on_demand_units, 0)
@@ -183,12 +183,112 @@ class PoolTests(unittest.TestCase):
 
         self.assertEqual(report.yesterday_on_demand_units, 100)
         self.assertAlmostEqual(report.yesterday_on_demand_pct or 0, 0.5, places=2)
-        self.assertAlmostEqual(report.yesterday_other_units, 2156.8258, places=2)
+        self.assertAlmostEqual(report.yesterday_other_units, 2256.8258, places=2)
         on_demand = [row for row in report.yesterday if row.pool == "On-demand"]
         self.assertEqual([(row.model, row.plan_units) for row in on_demand], [("grok-4.7-high", 100)])
         other = next(row for row in report.yesterday if row.model == "grok-4.7-high" and row.pool == "Other")
-        self.assertAlmostEqual(other.plan_units, 1457.7068, places=2)
+        self.assertAlmostEqual(other.plan_units, 1557.7068, places=2)
         self.assertEqual(report.cycle_on_demand_units, 0)
+
+    def test_full_pools_still_cap_the_projection(self) -> None:
+        # Both Spending bars are at 100%, so the unused-share formula has no
+        # remainder. Grants stay 120,000 and 11,000. Overflow is on-demand.
+        period = {
+            "planUsage": {
+                "totalSpend": 131018,
+                "autoPercentUsed": 100,
+                "apiPercentUsed": 100,
+                "totalPercentUsed": 100,
+            }
+        }
+        filled = [
+            {
+                "modelIntent": "cursor-grok-4.6-high",
+                "tier": 2,
+                "totalCents": 119722.97,
+                "inputTokens": "1",
+            },
+            {
+                "modelIntent": "grok-4.7-high",
+                "tier": 1,
+                "totalCents": 11015.78,
+                "inputTokens": "1",
+            },
+        ]
+        now = datetime(2026, 9, 29, 9, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        report = build_report(
+            SUMMARY,
+            period_usage=period,
+            yesterday_aggregations=[],
+            cycle_aggregations=filled,
+            projection_aggregations=filled,
+            timezone="Asia/Ho_Chi_Minh",
+            now=now,
+        )
+
+        self.assertEqual(report.days_elapsed, 25)
+        self.assertEqual(report.remaining_days, 5)
+        self.assertEqual(report.cursor_included_units, 120_000)
+        self.assertEqual(report.other_included_units, 11_000)
+        self.assertEqual(report.projected_eoc_total_units, 156_886.5)
+        self.assertEqual(report.projected_eoc_cursor_units, 120_000)
+        self.assertEqual(report.projected_eoc_other_units, 11_000)
+        self.assertEqual(report.projected_eoc_on_demand_units, 25_886.5)
+        self.assertEqual(report.estimated_on_demand_eoc_usd, 258.87)
+
+    def test_forecast_allocates_one_total_including_on_demand(self) -> None:
+        yesterday_ms = int(
+            datetime(2026, 9, 28, 12, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh")).timestamp()
+            * 1000
+        )
+        period = {
+            "planUsage": {
+                "totalSpend": 131018,
+                "autoPercentUsed": 100,
+                "apiPercentUsed": 100,
+                "totalPercentUsed": 100,
+            }
+        }
+        filled = [
+            {
+                "modelIntent": "cursor-grok-4.6-high",
+                "tier": 2,
+                "totalCents": 120_000,
+                "inputTokens": "1",
+            },
+            {
+                "modelIntent": "grok-4.7-high",
+                "tier": 1,
+                "totalCents": 11_000,
+                "inputTokens": "1",
+            },
+        ]
+        now = datetime(2026, 9, 29, 9, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        report = build_report(
+            SUMMARY,
+            period_usage=period,
+            yesterday_aggregations=[],
+            cycle_aggregations=filled,
+            projection_aggregations=filled,
+            timezone="Asia/Ho_Chi_Minh",
+            now=now,
+            usage_events=[
+                {
+                    "timestamp": str(yesterday_ms),
+                    "model": "grok-4.7-high",
+                    "kind": "USAGE_EVENT_KIND_USAGE_BASED",
+                    "chargedCents": 1000,
+                    "tokenUsage": {"inputTokens": 1, "outputTokens": 0},
+                }
+            ],
+        )
+
+        # (120,000 + 11,000 + 1,000) * 30 / 25 = 158,400.
+        self.assertEqual(report.projected_eoc_total_units, 158_400)
+        self.assertEqual(report.projected_eoc_cursor_units, 120_000)
+        self.assertEqual(report.projected_eoc_other_units, 11_000)
+        self.assertEqual(report.projected_eoc_on_demand_units, 27_400)
+        self.assertEqual(report.estimated_on_demand_eoc_usd, 274.0)
 
 
 if __name__ == "__main__":

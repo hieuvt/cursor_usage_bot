@@ -87,18 +87,22 @@ def format_report(report: UsageReport) -> str:
             f"{_fmt_pct(report.cycle_on_demand_pct)}"
         ),
         (
-            f"ước tính số plan unit on-demand sẽ dùng đến hết chu kỳ: "
-            f"{_fmt_units(report.projected_eoc_on_demand_units)}"
-        ),
-        (
-            f"ước tính số plan unit Cursor models sẽ dùng đến hết chu kỳ: "
-            f"{_fmt_units(report.projected_eoc_cursor_units)}"
+            f"ước tính tổng số plan unit sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_total_units)}"
             f" <i>({report.days_elapsed} ngày đã qua, "
             f"còn {report.remaining_days} ngày)</i>"
         ),
         (
+            f"ước tính số plan unit Cursor models sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_cursor_units)}"
+        ),
+        (
             f"ước tính số plan unit Other models sẽ dùng đến hết chu kỳ: "
             f"{_fmt_units(report.projected_eoc_other_units)}"
+        ),
+        (
+            f"ước tính số plan unit on-demand sẽ dùng đến hết chu kỳ: "
+            f"{_fmt_units(report.projected_eoc_on_demand_units)}"
         ),
         "",
         "<b>--- Ước tính số tiền on-demand phải trả cuối chu kỳ ---</b>",

@@ -12,6 +12,17 @@ USAGE_SUMMARY_PATH = "/api/usage-summary"
 FILTERED_EVENTS_PATH = "/api/dashboard/get-filtered-usage-events"
 CURRENT_PERIOD_PATH = "/api/dashboard/get-current-period-usage"
 AGGREGATED_USAGE_PATH = "/api/dashboard/get-aggregated-usage-events"
+# Present on a normal aggregate payload. A window with only on-demand usage
+# comes back as {} — no `aggregations` key — rather than an empty list.
+_AGGREGATE_TOTAL_KEYS = frozenset(
+    {
+        "totalInputTokens",
+        "totalOutputTokens",
+        "totalCacheReadTokens",
+        "totalCacheWriteTokens",
+        "totalCostCents",
+    }
+)
 ORIGIN = "https://cursor.com"
 
 
@@ -36,6 +47,25 @@ class CursorAPIError(Exception):
 
 class CursorSchemaError(CursorAPIError):
     """Raised when response JSON is missing expected fields (API may have changed)."""
+
+
+def _aggregation_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows for one aggregated-usage window.
+
+    Included usage is under ``aggregations``. A window that has none, such as
+    a day that was entirely on-demand, is ``{}`` with the key omitted.
+    """
+    if "aggregations" in data:
+        rows = data["aggregations"]
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    elif set(data) <= _AGGREGATE_TOTAL_KEYS:
+        return []
+    raise CursorSchemaError(
+        "aggregated-usage-events missing 'aggregations' "
+        "(dashboard API may have changed)",
+        endpoint=AGGREGATED_USAGE_PATH,
+    )
 
 
 class CursorClient:
@@ -111,14 +141,7 @@ class CursorClient:
             AGGREGATED_USAGE_PATH,
             json={"startDate": start_ms, "endDate": end_ms},
         )
-        rows = data.get("aggregations")
-        if not isinstance(rows, list):
-            raise CursorSchemaError(
-                "aggregated-usage-events missing 'aggregations' "
-                "(dashboard API may have changed)",
-                endpoint=AGGREGATED_USAGE_PATH,
-            )
-        return [row for row in rows if isinstance(row, dict)]
+        return _aggregation_rows(data)
 
     def iter_usage_events(
         self,

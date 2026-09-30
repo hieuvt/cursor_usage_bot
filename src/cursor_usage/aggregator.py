@@ -60,6 +60,7 @@ class UsageReport:
     cycle_cursor_pct: float | None
     cycle_other_pct: float | None
     cycle_on_demand_pct: float | None
+    projected_eoc_total_units: float | None
     projected_eoc_cursor_units: float | None
     projected_eoc_other_units: float | None
     projected_eoc_on_demand_units: float | None
@@ -152,12 +153,19 @@ def classify_model_pool(model: str) -> PoolKind:
     return "Other"
 
 
-def infer_pool_grants(period_usage: dict[str, Any]) -> tuple[float | None, float | None]:
+def infer_pool_grants(
+    period_usage: dict[str, Any],
+    *,
+    cursor_used: float | None = None,
+    other_used: float | None = None,
+) -> tuple[float | None, float | None]:
     """Infer Cursor and Other included grants from the dashboard percent meters.
 
     ``totalSpend / totalPercentUsed`` is the combined grant. While Cursor Models
     is at 100%, the unused share of that grant is the Other Models pool.
-    Grants come back rounded to the nearest 100 plan units.
+    Once both pools are full there is no unused share left: the combined grant
+    is spend rounded to the nearest 100, and Other Models usage (already on
+    its grant) supplies the split. Grants come back in plan units.
     """
     plan = _plan_usage(period_usage)
     if plan is None:
@@ -170,17 +178,18 @@ def infer_pool_grants(period_usage: dict[str, Any]) -> tuple[float | None, float
     if total_spend <= 0 or total_pct <= 0:
         return None, None
 
+    if auto_pct >= 100.0 and api_pct >= 100.0:
+        return _grants_when_both_pools_full(
+            total_spend, total_pct, cursor_used, other_used
+        )
+
     total_grant = round(total_spend / (total_pct / 100.0))
     auto_frac = auto_pct / 100.0
     api_frac = api_pct / 100.0
 
     if auto_pct >= 100.0:
-        if api_frac >= 1.0:
-            return None, None
         raw_other = (total_grant - total_spend) / (1.0 - api_frac)
     elif api_pct >= 100.0:
-        if auto_frac >= 1.0:
-            return None, None
         raw_cursor = (total_grant - total_spend) / (1.0 - auto_frac)
         raw_other = total_grant - raw_cursor
     else:
@@ -193,6 +202,34 @@ def infer_pool_grants(period_usage: dict[str, Any]) -> tuple[float | None, float
     other_grant = int(round(raw_other / 100.0) * 100)
     cursor_grant = int(total_grant - other_grant)
     if cursor_grant < 0 or other_grant < 0:
+        return None, None
+    return float(cursor_grant), float(other_grant)
+
+
+def _grants_when_both_pools_full(
+    total_spend: float,
+    total_pct: float,
+    cursor_used: float | None,
+    other_used: float | None,
+) -> tuple[float | None, float | None]:
+    """Recover the pool split after both Spending bars have reached 100%.
+
+    The meter can sit slightly past the cap, so the combined grant is spend
+    rounded to the nearest 100. Other Models cents are already on that pool's
+    grant; Cursor aggregation often lags the meter, so Cursor gets the rest.
+    """
+    if (
+        cursor_used is None
+        or other_used is None
+        or cursor_used <= 0
+        or other_used <= 0
+    ):
+        return None, None
+    total_exact = total_spend / (total_pct / 100.0)
+    total_grant = int(round(total_exact / 100.0) * 100)
+    other_grant = int(round(other_used / 100.0) * 100)
+    cursor_grant = total_grant - other_grant
+    if cursor_grant <= 0 or other_grant <= 0:
         return None, None
     return float(cursor_grant), float(other_grant)
 
@@ -213,8 +250,8 @@ def build_report(
     Cycle percents are ``autoPercentUsed`` / ``apiPercentUsed`` (the Spending
     bars). Model rows come from aggregated usage split by tier, for the current
     period. Yesterday is the previous local day. The end-of-cycle projection
-    uses full days only (through yesterday): Cursor stops at its grant, the
-    overflow is added to Other, and only usage past both grants is on-demand.
+    uses full days only (through yesterday): one total run-rate, then Cursor
+    and Other fill up to their grants and the remainder is on-demand.
     """
     window = compute_report_window(summary, timezone_name=timezone, now=now)
     plan = _plan_usage(period_usage) or {}
@@ -225,7 +262,6 @@ def build_report(
     on_demand_limit = _extract_on_demand_limit(summary)
     cycle_on_demand_units = _extract_on_demand_units(summary)
 
-    cursor_included_units, other_included_units = infer_pool_grants(period_usage)
     # Pool grants already include purchased usage and provider bonus.
     # bonusSpend is consumption, not a second allowance on top of the pools.
     cursor_bonus_units = 0.0
@@ -235,23 +271,27 @@ def build_report(
     yesterday_on_demand = _on_demand_models(
         events, start=window.yesterday_start, end=window.yesterday_end
     )
-    cycle_on_demand_rows = _on_demand_models(
+    # Forecast uses full days through yesterday. The live cycle table includes today.
+    projection_on_demand = _on_demand_models(
         events, start=window.cycle_start, end=window.cycle_end
     )
-    # Live cycle rows run through now, so on-demand after yesterday still counts.
+    cycle_on_demand_rows = projection_on_demand
     live_end = now.astimezone(ZoneInfo(timezone)) if now is not None else window.cycle_end
     if live_end > window.cycle_end:
         cycle_on_demand_rows = _on_demand_models(
             events, start=window.cycle_start, end=live_end
         )
 
-    yesterday_raw = _without_on_demand(
-        _models_from_aggregations(yesterday_aggregations), yesterday_on_demand
-    )
-    cycle_raw = _without_on_demand(
-        _models_from_aggregations(cycle_aggregations), cycle_on_demand_rows
-    )
+    # Aggregated rows are included-pool usage. Usage-based cents are not in
+    # those totals, so they stay on the On-demand rows only.
+    yesterday_raw = _models_from_aggregations(yesterday_aggregations)
+    cycle_raw = _models_from_aggregations(cycle_aggregations)
     projection_raw = _models_from_aggregations(projection_aggregations)
+    cursor_included_units, other_included_units = infer_pool_grants(
+        period_usage,
+        cursor_used=_sum_pool(cycle_raw, "Cursor"),
+        other_used=_sum_pool(cycle_raw, "Other"),
+    )
 
     yesterday_cursor_units = _sum_pool(yesterday_raw, "Cursor")
     yesterday_other_units = _sum_pool(yesterday_raw, "Other")
@@ -260,6 +300,11 @@ def build_report(
     cycle_other_units = _sum_pool(cycle_raw, "Other")
     projection_cursor_units = _sum_pool(projection_raw, "Cursor")
     projection_other_units = _sum_pool(projection_raw, "Other")
+    projection_on_demand_units = _sum_pool(projection_on_demand, "On-demand")
+    projection_total_units = round(
+        projection_cursor_units + projection_other_units + projection_on_demand_units,
+        4,
+    )
 
     yesterday_cursor_pct = _pct_of_pool(yesterday_cursor_units, cursor_included_units)
     yesterday_other_pct = _pct_of_pool(yesterday_other_units, other_included_units)
@@ -289,19 +334,20 @@ def build_report(
     )
     total_cycle_days = days_elapsed + remaining_days
 
+    projected_eoc_total_units: float | None = None
     projected_eoc_cursor_units: float | None = None
     projected_eoc_other_units: float | None = None
     projected_eoc_on_demand_units: float | None = None
     estimated_on_demand_eoc_usd: float | None = None
     if days_elapsed > 0 and total_cycle_days > 0:
         (
+            projected_eoc_total_units,
             projected_eoc_cursor_units,
             projected_eoc_other_units,
             projected_eoc_on_demand_units,
             estimated_on_demand_eoc_usd,
         ) = project_end_of_cycle(
-            cursor_used=projection_cursor_units,
-            other_used=projection_other_units,
+            used_units=projection_total_units,
             days_elapsed=days_elapsed,
             total_cycle_days=total_cycle_days,
             cursor_included=cursor_included_units,
@@ -331,6 +377,7 @@ def build_report(
         cycle_cursor_pct=cycle_cursor_pct,
         cycle_other_pct=cycle_other_pct,
         cycle_on_demand_pct=cycle_on_demand_pct,
+        projected_eoc_total_units=projected_eoc_total_units,
         projected_eoc_cursor_units=projected_eoc_cursor_units,
         projected_eoc_other_units=projected_eoc_other_units,
         projected_eoc_on_demand_units=projected_eoc_on_demand_units,
@@ -569,41 +616,6 @@ def _on_demand_models(
     return rows
 
 
-def _without_on_demand(
-    included: list[ModelUsage],
-    on_demand: list[ModelUsage],
-) -> list[ModelUsage]:
-    """Remove usage-based cents from the tier buckets so they are not counted twice.
-
-    Aggregated rows do not split on-demand. Those cents land in Other (then
-    Cursor if Other cannot absorb them).
-    """
-    remaining = {(row.model, row.pool): row for row in included}
-    for demand in on_demand:
-        leftover_units = demand.plan_units
-        leftover_tokens = demand.total_tokens
-        for pool in ("Other", "Cursor"):
-            key = (demand.model, pool)
-            row = remaining.get(key)
-            if row is None or (leftover_units <= 0 and leftover_tokens <= 0):
-                continue
-            take_units = min(row.plan_units, leftover_units)
-            take_tokens = min(row.total_tokens, leftover_tokens)
-            leftover_units = round(leftover_units - take_units, 4)
-            leftover_tokens -= take_tokens
-            new_units = round(row.plan_units - take_units, 4)
-            new_tokens = row.total_tokens - take_tokens
-            if new_units <= 0 and new_tokens <= 0:
-                del remaining[key]
-            else:
-                remaining[key] = replace(
-                    row, plan_units=new_units, total_tokens=new_tokens
-                )
-    rows = list(remaining.values())
-    rows.sort(key=lambda m: (-m.plan_units, m.model))
-    return rows
-
-
 def _with_on_demand_rows(
     included: list[ModelUsage],
     on_demand: list[ModelUsage],
@@ -683,42 +695,38 @@ def _extract_on_demand_usd(summary: dict[str, Any]) -> float | None:
 
 def project_end_of_cycle(
     *,
-    cursor_used: float,
-    other_used: float,
+    used_units: float,
     days_elapsed: int,
     total_cycle_days: int,
     cursor_included: float | None,
     other_included: float | None,
     on_demand_already_usd: float,
-) -> tuple[float, float, float, float]:
-    """Project included-pool usage through the reset.
+) -> tuple[float, float, float, float, float]:
+    """Project plan units through the reset, then allocate them by pool cap.
 
-    Continue the combined daily rate. Cursor Models stops at its grant; every
-    unit past that grant is Other Models usage. Other Models stops at its
-    grant; the remainder is on-demand.
+    The daily rate is every plan unit used so far (Cursor, Other, and
+    on-demand) divided by elapsed days. That rate runs to the end of the
+    cycle. The total fills Cursor Models up to its grant, then Other Models
+    up to its grant. Units past both grants are on-demand.
     """
-    scale = total_cycle_days / days_elapsed
-    raw_cursor = cursor_used * scale
-    raw_other = other_used * scale
+    projected_total = used_units * total_cycle_days / days_elapsed
 
     if cursor_included is not None and cursor_included > 0:
-        projected_cursor = min(raw_cursor, cursor_included)
-        spill = max(0.0, raw_cursor - cursor_included)
+        projected_cursor = min(projected_total, cursor_included)
     else:
-        projected_cursor = raw_cursor
-        spill = 0.0
+        projected_cursor = projected_total
+    remaining = projected_total - projected_cursor
 
-    other_demand = raw_other + spill
     if other_included is not None and other_included > 0:
-        projected_other = min(other_demand, other_included)
-        on_demand_units = max(0.0, other_demand - other_included)
+        projected_other = min(remaining, other_included)
     else:
-        projected_other = other_demand
-        on_demand_units = 0.0
+        projected_other = remaining
+    on_demand_units = max(0.0, projected_total - projected_cursor - projected_other)
 
     on_demand_units = round(on_demand_units, 4)
     on_demand_usd = round(on_demand_units * USD_PER_PLAN_UNIT, 2)
     return (
+        round(projected_total, 4),
         round(projected_cursor, 4),
         round(projected_other, 4),
         on_demand_units,
